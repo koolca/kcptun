@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	//"fmt"
 
 	"github.com/pkg/errors"
 	"golang.org/x/net/ipv4"
@@ -120,11 +121,16 @@ type (
 	setDSCP interface {
 		SetDSCP(int) error
 	}
+
+	setFEC interface {
+		SetFEC(dataShards, parityShards int) error
+	}
 )
 
 // newUDPSession create a new udp session for client or server
 func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn net.PacketConn, ownConn bool, remote net.Addr, block BlockCrypt) *UDPSession {
 	sess := new(UDPSession)
+	//fmt.Println("new udpsession")
 	sess.die = make(chan struct{})
 	sess.nonce = new(nonceAES128)
 	sess.nonce.Init()
@@ -505,6 +511,19 @@ func (s *UDPSession) SetDSCP(dscp int) error {
 		}
 	}
 	return errInvalidOperation
+}
+
+func (s *UDPSession) SetFEC(dataShards, parityShards int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.block != nil {
+		s.fecEncoder = newFECEncoder(dataShards, parityShards, cryptHeaderSize)
+	} else {
+		s.fecEncoder = newFECEncoder(dataShards, parityShards, 0)
+	}
+	//fmt.Println("udpsession SetFEC")
+
+	return nil
 }
 
 // SetReadBuffer sets the socket read buffer, no effect if it's accepted from Listener
@@ -905,6 +924,23 @@ func (l *Listener) SetDSCP(dscp int) error {
 	return errInvalidOperation
 }
 
+func (l *Listener) SetFEC(dataShards, parityShards int) error {
+    l.dataShards = dataShards
+    l.parityShards = parityShards
+	//if l.s != nil {
+	//	fmt.Println("listener1 SetFEC")
+	//	l.s.SetFEC(dataShards, parityShards)
+	//}
+    for addr := range l.sessions {
+        //fmt.Println(addr, " is ", l.sessions[addr])
+        if l.sessions[addr] != nil {
+            l.sessions[addr].SetFEC(dataShards, parityShards)
+        }
+    }
+	//fmt.Println("listener2 SetFEC")
+	return nil
+}
+
 // Accept implements the Accept method in the Listener interface; it waits for the next call and returns a generic Conn.
 func (l *Listener) Accept() (net.Conn, error) {
 	return l.AcceptKCP()
@@ -1008,6 +1044,7 @@ func ServeConn(block BlockCrypt, dataShards, parityShards int, conn net.PacketCo
 
 func serveConn(block BlockCrypt, dataShards, parityShards int, conn net.PacketConn, ownConn bool) (*Listener, error) {
 	l := new(Listener)
+	//fmt.Println("new listener")
 	l.conn = conn
 	l.ownConn = ownConn
 	l.sessions = make(map[string]*UDPSession)

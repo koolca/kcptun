@@ -30,6 +30,7 @@ type Config struct {
 	SmuxVer      int    `json:"smuxver"`
 	KeepAlive    int    `json:"keepalive"`
 	Log          string `json:"log"`
+	Fifo         string `json:"fifo"`
 	SnmpLog      string `json:"snmplog"`
 	SnmpPeriod   int    `json:"snmpperiod"`
 	Pprof        bool   `json:"pprof"`

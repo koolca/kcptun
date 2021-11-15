@@ -10,6 +10,10 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"bufio"
+	"strings"
+	"strconv"
+	"syscall"
 	"sync"
 	"time"
 
@@ -32,7 +36,8 @@ const (
 )
 
 // VERSION is injected by buildflags
-var VERSION = "SELFBUILD"
+//var VERSION = "SELFBUILD"
+var VERSION = "KOOLCABUILD"
 
 // handle multiplex-ed connection
 func handleMux(conn net.Conn, config *Config) {
@@ -259,6 +264,11 @@ func main() {
 			Value: "",
 			Usage: "specify a log file to output, default goes to stderr",
 		},
+		cli.StringFlag{
+			Name:  "fifo",
+			Value: "",
+			Usage: "specify a fifo file",
+		},
 		cli.BoolFlag{
 			Name:  "quiet",
 			Usage: "to suppress the 'stream open/close' messages",
@@ -298,6 +308,7 @@ func main() {
 		config.SmuxVer = c.Int("smuxver")
 		config.KeepAlive = c.Int("keepalive")
 		config.Log = c.String("log")
+		config.Fifo = c.String("fifo")
 		config.SnmpLog = c.String("snmplog")
 		config.SnmpPeriod = c.Int("snmpperiod")
 		config.Pprof = c.Bool("pprof")
@@ -446,8 +457,52 @@ func main() {
 		checkError(err)
 		wg.Add(1)
 		go loop(lis)
+
+        if config.Fifo != "" {
+            wg.Add(1)
+            go func() {
+                defer wg.Done()
+                os.Remove(config.Fifo)
+                syscall.Mkfifo(config.Fifo, 0666)
+                log.Println("Open named pipe file for read:", config.Fifo)
+                file, err := os.OpenFile(config.Fifo, os.O_CREATE, os.ModeNamedPipe)
+                if err != nil {
+                    log.Fatal("Open named pipe file error:", err)
+                }
+
+                reader := bufio.NewReader(file)
+
+                for {
+                    //line, err := reader.ReadBytes('\n')
+                    line, _, err := reader.ReadLine()
+                    if err == nil {
+                        //fmt.Print("load string:" + string(line))
+                        message := strings.Split(string(line), " ")
+                        if strings.Contains(message[0], "fec") {
+                            ds, _ := strconv.Atoi(message[1])
+                            ps, _ := strconv.Atoi(message[2])
+                            if ds != config.DataShard || ps != config.ParityShard {
+                                config.DataShard = ds
+                                config.ParityShard = ps
+                                log.Println("ds:", ds, "ps:", ps)
+                                //lis.SetFEC(config.DataShard, config.ParityShard)
+                                if err := lis.SetFEC(config.DataShard, config.ParityShard); err != nil {
+                                    log.Println("SetFEC:", err)
+                                }
+                            }
+                        } else {
+                            log.Println("Unknown call")
+                        }
+                    }
+                    time.Sleep(time.Second)
+                }
+            } ()
+        }
+
 		wg.Wait()
 		return nil
 	}
+
 	myApp.Run(os.Args)
 }
+

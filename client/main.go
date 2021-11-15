@@ -8,6 +8,11 @@ import (
 	"math/rand"
 	"net"
 	"os"
+    "bufio"
+    "strings"
+    "strconv"
+    "syscall"
+    "sync"
 	"time"
 
 	"golang.org/x/crypto/pbkdf2"
@@ -29,7 +34,8 @@ const (
 )
 
 // VERSION is injected by buildflags
-var VERSION = "SELFBUILD"
+//var VERSION = "SELFBUILD"
+var VERSION = "KOOLCABUILD"
 
 // handleClient aggregates connection p1 on mux with 'writeLock'
 func handleClient(session *smux.Session, p1 net.Conn, quiet bool) {
@@ -230,6 +236,11 @@ func main() {
 			Value: "",
 			Usage: "specify a log file to output, default goes to stderr",
 		},
+        cli.StringFlag{
+            Name:  "fifo",
+            Value: "",
+            Usage: "specify a fifo file",
+        },
 		cli.BoolFlag{
 			Name:  "quiet",
 			Usage: "to suppress the 'stream open/close' messages",
@@ -272,6 +283,7 @@ func main() {
 		config.SmuxVer = c.Int("smuxver")
 		config.KeepAlive = c.Int("keepalive")
 		config.Log = c.String("log")
+        config.Fifo = c.String("fifo")
 		config.SnmpLog = c.String("snmplog")
 		config.SnmpPeriod = c.Int("snmpperiod")
 		config.Quiet = c.Bool("quiet")
@@ -369,10 +381,10 @@ func main() {
 			block, _ = kcp.NewAESBlockCrypt(pass)
 		}
 
-		createConn := func() (*smux.Session, error) {
+		createConn := func() (*smux.Session, *kcp.UDPSession, error) {
 			kcpconn, err := dial(&config, block)
 			if err != nil {
-				return nil, errors.Wrap(err, "dial()")
+				return nil, nil, errors.Wrap(err, "dial()")
 			}
 			kcpconn.SetStreamMode(true)
 			kcpconn.SetWriteDelay(false)
@@ -409,16 +421,16 @@ func main() {
 				session, err = smux.Client(generic.NewCompStream(kcpconn), smuxConfig)
 			}
 			if err != nil {
-				return nil, errors.Wrap(err, "createConn()")
+				return nil, nil, errors.Wrap(err, "createConn()")
 			}
-			return session, nil
+			return session, kcpconn, nil
 		}
 
 		// wait until a connection is ready
-		waitConn := func() *smux.Session {
+		waitConn := func() (*smux.Session, *kcp.UDPSession) {
 			for {
-				if session, err := createConn(); err == nil {
-					return session
+				if session, conn, err := createConn(); err == nil {
+					return session, conn
 				} else {
 					log.Println("re-connecting:", err)
 					time.Sleep(time.Second)
@@ -433,30 +445,80 @@ func main() {
 		chScavenger := make(chan timedSession, 128)
 		go scavenger(chScavenger, &config)
 
-		// start listener
-		numconn := uint16(config.Conn)
-		muxes := make([]timedSession, numconn)
-		rr := uint16(0)
-		for {
-			p1, err := listener.AcceptTCP()
-			if err != nil {
-				log.Fatalf("%+v", err)
-			}
-			idx := rr % numconn
+        // start listener
+        numconn := uint16(config.Conn)
+        muxes := make([]timedSession, numconn)
+        connes := make([]*kcp.UDPSession, numconn)
+        var wg sync.WaitGroup
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            rr := uint16(0)
+            for {
+                p1, err := listener.AcceptTCP()
+                if err != nil {
+                    log.Fatalf("%+v", err)
+                }
+                idx := rr % numconn
 
-			// do auto expiration && reconnection
-			if muxes[idx].session == nil || muxes[idx].session.IsClosed() ||
-				(config.AutoExpire > 0 && time.Now().After(muxes[idx].expiryDate)) {
-				muxes[idx].session = waitConn()
-				muxes[idx].expiryDate = time.Now().Add(time.Duration(config.AutoExpire) * time.Second)
-				if config.AutoExpire > 0 { // only when autoexpire set
-					chScavenger <- muxes[idx]
-				}
-			}
+                // do auto expiration && reconnection
+                if muxes[idx].session == nil || muxes[idx].session.IsClosed() ||
+                (config.AutoExpire > 0 && time.Now().After(muxes[idx].expiryDate)) {
+                    muxes[idx].session, connes[idx] = waitConn()
+                    muxes[idx].expiryDate = time.Now().Add(time.Duration(config.AutoExpire) * time.Second)
+                    if config.AutoExpire > 0 { // only when autoexpire set
+                        chScavenger <- muxes[idx]
+                    }
+                }
 
-			go handleClient(muxes[idx].session, p1, config.Quiet)
-			rr++
-		}
+                go handleClient(muxes[idx].session, p1, config.Quiet)
+                rr++
+            }
+        } ()
+
+        if config.Fifo != "" {
+            wg.Add(1)
+            go func() {
+                defer wg.Done()
+                os.Remove(config.Fifo)
+                syscall.Mkfifo(config.Fifo, 0666)
+                log.Println("Open named pipe file for read:", config.Fifo)
+                file, err := os.OpenFile(config.Fifo, os.O_CREATE, os.ModeNamedPipe)
+                if err != nil {
+                    log.Fatal("Open named pipe file error:", err)
+                }
+
+                reader := bufio.NewReader(file)
+
+                for {
+                    //line, err := reader.ReadBytes('\n')
+                    line, _, err := reader.ReadLine()
+                    if err == nil {
+                        //fmt.Print("load string:" + string(line))
+                        message := strings.Split(string(line), " ")
+                        if strings.Contains(message[0], "fec") {
+                            ds, _ := strconv.Atoi(message[1])
+                            ps, _ := strconv.Atoi(message[2])
+                            if ds != config.DataShard || ps != config.ParityShard {
+                                config.DataShard = ds
+                                config.ParityShard = ps
+                                log.Println("ds:", ds, "ps:", ps)
+                                for addr := range connes {
+                                    if connes[addr] != nil {
+                                        connes[addr].SetFEC(config.DataShard, config.ParityShard)
+                                    }
+                                }
+                            }
+                        } else {
+                            log.Println("Unknown call")
+                        }
+                    }
+                    time.Sleep(time.Second)
+                }
+            } ()
+        }
+        wg.Wait()
+        return nil
 	}
 	myApp.Run(os.Args)
 }
@@ -497,4 +559,10 @@ func scavenger(ch chan timedSession, config *Config) {
 			sessionList = newList
 		}
 	}
+}
+
+
+func pipe_read(kcpconn *kcp.UDPSession, config *Config) {
+    if config.Fifo != "" {
+    }
 }
