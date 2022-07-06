@@ -115,7 +115,7 @@ func main() {
 		cli.StringFlag{
 			Name:  "crypt",
 			Value: "aes",
-			Usage: "aes, aes-128, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none",
+			Usage: "aes, aes-128, aes-192, salsa20, blowfish, twofish, cast5, 3des, tea, xtea, xor, sm4, none, null",
 		},
 		cli.StringFlag{
 			Name:  "mode",
@@ -352,6 +352,8 @@ func main() {
 		log.Println("key derivation done")
 		var block kcp.BlockCrypt
 		switch config.Crypt {
+		case "null":
+			block = nil
 		case "sm4":
 			block, _ = kcp.NewSM4BlockCrypt(pass[:16])
 		case "tea":
